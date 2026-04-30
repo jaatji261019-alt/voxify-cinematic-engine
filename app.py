@@ -1,64 +1,130 @@
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
 import requests
 import os
-from moviepy.editor import *
+from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip
 from uuid import uuid4
 
-app = FastAPI()
+app = FastAPI(title="Voxify Cinematic Engine 🎬")
 
+# ================= CONFIG =================
 TEMP_DIR = "temp"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# 🎨 FREE AI IMAGE (Pollinations)
+MAX_SCENES = 6
+IMAGE_DURATION = 3
+
+
+# ================= IMAGE FETCH =================
 def get_image(prompt, idx):
-    url = f"https://image.pollinations.ai/prompt/{prompt} cinematic lighting 4k"
-    img_path = f"{TEMP_DIR}/img_{idx}.jpg"
+    try:
+        url = f"https://image.pollinations.ai/prompt/{prompt} cinematic lighting 4k"
+        img_path = f"{TEMP_DIR}/img_{idx}_{uuid4().hex}.jpg"
 
-    img = requests.get(url).content
-    with open(img_path, "wb") as f:
-        f.write(img)
+        res = requests.get(url, timeout=15)
 
-    return img_path
+        if res.status_code != 200:
+            return None
+
+        with open(img_path, "wb") as f:
+            f.write(res.content)
+
+        return img_path
+
+    except Exception as e:
+        print("Image error:", e)
+        return None
 
 
-# 🎬 CREATE CINEMATIC VIDEO
+# ================= AUDIO DOWNLOAD =================
+def download_audio(audio_url):
+    try:
+        path = f"{TEMP_DIR}/audio_{uuid4().hex}.mp3"
+
+        res = requests.get(audio_url, timeout=20)
+
+        if res.status_code != 200:
+            return None
+
+        with open(path, "wb") as f:
+            f.write(res.content)
+
+        return path
+
+    except Exception as e:
+        print("Audio error:", e)
+        return None
+
+
+# ================= VIDEO =================
 @app.post("/cinematic")
 async def create_video(data: dict):
-    text = data.get("text")
-    audio_url = data.get("audioUrl")
+    try:
+        text = data.get("text")
+        audio_url = data.get("audioUrl")
 
-    if not text or not audio_url:
-        return {"error": "Missing text/audio"}
+        if not text or not audio_url:
+            raise HTTPException(status_code=400, detail="Missing text/audio")
 
-    # 🎧 download audio
-    audio_path = f"{TEMP_DIR}/audio.mp3"
-    audio_data = requests.get(audio_url).content
-    with open(audio_path, "wb") as f:
-        f.write(audio_data)
+        # ================= AUDIO =================
+        audio_path = download_audio(audio_url)
+        if not audio_path:
+            raise HTTPException(status_code=500, detail="Audio download failed")
 
-    # ✂️ split scenes
-    scenes = text.split(".")
-    clips = []
+        # ================= SCENES =================
+        scenes = [s.strip() for s in text.split(".") if s.strip()][:MAX_SCENES]
 
-    for i, scene in enumerate(scenes):
-        if not scene.strip():
-            continue
+        clips = []
 
-        img_path = get_image(scene, i)
+        for i, scene in enumerate(scenes):
+            img_path = get_image(scene, i)
 
-        clip = ImageClip(img_path).set_duration(3)
-        clip = clip.resize((720, 1280))
+            if not img_path:
+                continue
 
-        clips.append(clip)
+            clip = (
+                ImageClip(img_path)
+                .set_duration(IMAGE_DURATION)
+                .resize((720, 1280))
+                .fadein(0.5)
+                .fadeout(0.5)
+            )
 
-    # 🎬 merge all
-    video = concatenate_videoclips(clips, method="compose")
+            clips.append(clip)
 
-    audio = AudioFileClip(audio_path)
-    video = video.set_audio(audio)
+        if not clips:
+            raise HTTPException(status_code=500, detail="No images generated")
 
-    output_path = f"{TEMP_DIR}/output_{uuid4().hex}.mp4"
-    video.write_videofile(output_path, fps=24)
+        # ================= MERGE =================
+        video = concatenate_videoclips(clips, method="compose")
 
-    return FileResponse(output_path, media_type="video/mp4", filename="cinematic.mp4")
+        audio = AudioFileClip(audio_path)
+        video = video.set_audio(audio)
+
+        # ================= OUTPUT =================
+        output_path = f"{TEMP_DIR}/video_{uuid4().hex}.mp4"
+
+        video.write_videofile(
+            output_path,
+            fps=24,
+            codec="libx264",
+            audio_codec="aac",
+            threads=2,
+            preset="ultrafast"
+        )
+
+        return FileResponse(
+            output_path,
+            media_type="video/mp4",
+            filename="voxify_cinematic.mp4"
+        )
+
+    except HTTPException as e:
+        raise e
+
+    except Exception as e:
+        print("Server error:", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
